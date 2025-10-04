@@ -1,20 +1,17 @@
-from flask import Flask, request, jsonify, send_from_directory, session
+import os
+import uuid
+import json
+import traceback
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from openai import OpenAI
-import os
 from dotenv import load_dotenv
-import traceback
-from datetime import timedelta
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
-
-# Secret key for session
-app.secret_key = os.getenv("SESSION_SECRET_KEY", "supersecret_dev_key")
-app.permanent_session_lifetime = timedelta(hours=2)
+CORS(app)
 
 # OpenRouter API key
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -27,7 +24,7 @@ client = OpenAI(
     api_key=OPENROUTER_API_KEY
 )
 
-# System message
+# System prompt
 system_message = {
     "role": "system",
     "content": (
@@ -38,6 +35,29 @@ system_message = {
         "'I'm here to help you with open-source and opportunities. I can’t help with that.'"
     )
 }
+
+# Store chat history in-memory (for production, use a database)
+CHAT_DB_FILE = "chat_history.json"
+if os.path.exists(CHAT_DB_FILE):
+    with open(CHAT_DB_FILE, "r") as f:
+        CHAT_HISTORY_DB = json.load(f)
+else:
+    CHAT_HISTORY_DB = {}
+
+def fetch_chat_history(user_id):
+    if user_id in CHAT_HISTORY_DB:
+        return CHAT_HISTORY_DB[user_id]
+    else:
+        CHAT_HISTORY_DB[user_id] = [system_message]
+        return CHAT_HISTORY_DB[user_id]
+
+def save_message(user_id, role, content):
+    if user_id not in CHAT_HISTORY_DB:
+        CHAT_HISTORY_DB[user_id] = [system_message]
+    CHAT_HISTORY_DB[user_id].append({"role": role, "content": content})
+    # persist to disk
+    with open(CHAT_DB_FILE, "w") as f:
+        json.dump(CHAT_HISTORY_DB, f, indent=2)
 
 # Serve frontend
 @app.route("/")
@@ -53,39 +73,39 @@ def index():
 def chat():
     try:
         data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON payload provided"}), 400
-
-        user_input = data.get("message", "").strip()
-        if not user_input:
+        if not data or "message" not in data:
             return jsonify({"error": "No message provided"}), 400
 
+        user_input = data["message"].strip()
+        if not user_input:
+            return jsonify({"error": "Empty message"}), 400
+
+        # Get or generate user_id
+        user_id = data.get("user_id") or str(uuid.uuid4())
+
+        # End session politely
         if user_input.lower() in ["exit", "quit", "bye"]:
-            session.clear()
-            return jsonify({"response": "It was great helping you! Keep contributing! 👋"})
+            return jsonify({"response": "It was great helping you! Keep contributing! 👋", "user_id": user_id})
 
-        # Initialize session chat history
-        if "chat_history" not in session:
-            session["chat_history"] = [system_message]
+        # Fetch chat history
+        chat_history = fetch_chat_history(user_id)
+        chat_history.append({"role": "user", "content": user_input})
 
-        # Add user input
-        session["chat_history"].append({"role": "user", "content": user_input})
-
-        # Call OpenRouter API
+        # Call OpenRouter
         completion = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70b-instruct",
-            messages=session["chat_history"],
+            model="meta-llama/Llama-3.3-70b-instruct",  # replace with a valid model
+            messages=chat_history,
             max_tokens=400,
             temperature=0.7
         )
 
         bot_response = completion.choices[0].message.content.strip()
 
-        # Save bot response
-        session["chat_history"].append({"role": "assistant", "content": bot_response})
-        session.modified = True
+        # Save messages
+        save_message(user_id, "user", user_input)
+        save_message(user_id, "assistant", bot_response)
 
-        return jsonify({"response": bot_response})
+        return jsonify({"response": bot_response, "user_id": user_id})
 
     except Exception as e:
         traceback.print_exc()
